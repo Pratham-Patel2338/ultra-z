@@ -7,6 +7,7 @@ import aiohttp
 
 from app.core.config import settings
 from app.core.logging_config import setup_logging
+from app.core.performance import record_llm_first_token
 
 logger = setup_logging(__name__)
 
@@ -48,11 +49,25 @@ class OllamaService:
         self.retry_attempts = retry_attempts
         self.retry_delay = retry_delay
         self._session: aiohttp.ClientSession | None = None
+        self._session_loop: asyncio.AbstractEventLoop | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
-        if self._session is None or self._session.closed:
+        current_loop = asyncio.get_running_loop()
+        if (
+            self._session is None
+            or self._session.closed
+            or self._session_loop is None
+            or self._session_loop is not current_loop
+            or self._session_loop.is_closed()
+        ):
+            if self._session is not None and not self._session.closed:
+                try:
+                    await self._session.close()
+                except RuntimeError:
+                    logger.warning("Discarding Ollama HTTP session from a closed event loop")
             self._session = aiohttp.ClientSession()
+            self._session_loop = current_loop
         return self._session
 
     @staticmethod
@@ -78,6 +93,8 @@ class OllamaService:
         """Close the HTTP session."""
         if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
+        self._session_loop = None
 
     async def _call_with_retry(
         self,
@@ -234,11 +251,61 @@ class OllamaService:
             logger.error("Ollama unavailable: %s", exc, exc_info=True)
             raise
 
+    def _build_generation_payload(
+        self,
+        prompt: str,
+        system_prompt: str | None = None,
+        temperature: float = 0.2,
+        top_p: float = 0.8,
+    ) -> dict:
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": False,
+            "options": {
+                "num_predict": int(getattr(settings, "ollama_num_predict", 256)),
+                "num_ctx": int(getattr(settings, "ollama_num_ctx", 2048)),
+                "repeat_penalty": float(getattr(settings, "ollama_repeat_penalty", 1.05)),
+                "keep_alive": "30m",
+            },
+        }
+
+        if system_prompt:
+            payload["system"] = system_prompt
+        return payload
+
+    def _build_chat_payload(
+        self,
+        chat_messages: list[dict],
+        system_prompt: str | None = None,
+        temperature: float = 0.2,
+        top_p: float = 0.8,
+    ) -> dict:
+        payload = {
+            "model": self.model,
+            "messages": chat_messages,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": False,
+            "options": {
+                "num_predict": int(getattr(settings, "ollama_num_predict", 256)),
+                "num_ctx": int(getattr(settings, "ollama_num_ctx", 2048)),
+                "repeat_penalty": float(getattr(settings, "ollama_repeat_penalty", 1.05)),
+                "keep_alive": "30m",
+            },
+        }
+
+        if system_prompt:
+            payload["system"] = system_prompt
+        return payload
+
     async def generate(
         self,
         prompt: str,
         system_prompt: str | None = None,
-        temperature: float = 0.3,
+        temperature: float = 0.2,
         top_p: float = 0.8,
     ) -> str:
         """
@@ -253,21 +320,9 @@ class OllamaService:
         Returns:
             Generated response text or empty string on error
         """
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": False,
-            "options": {
-                "num_predict": 60,
-                "keep_alive": "30m",
-            },
-        }
+        payload = self._build_generation_payload(prompt, system_prompt, temperature, top_p)
 
-        if system_prompt:
-            payload["system"] = system_prompt
-
+        logger.info("LLM request started")
         logger.info(f"Generating response from Ollama (model: {self.model})")
         start = time.perf_counter()
 
@@ -277,8 +332,8 @@ class OllamaService:
             json=payload,
         )
         elapsed = time.perf_counter() - start
-        logger.info("LLM stage completed in %.3f sec", elapsed)
-        
+        logger.info("LLM finished in %.3f sec", elapsed)
+
         if result and "response" in result:
             response_text = result["response"].strip()
             logger.info(f"Successfully generated response ({len(response_text)} chars)")
@@ -308,23 +363,14 @@ class OllamaService:
         """
         import json
 
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": True,
-            "options": {
-                "num_predict": 60,
-                "keep_alive": "30m",
-            },
-        }
+        payload = self._build_generation_payload(prompt, system_prompt, temperature, top_p)
+        payload["stream"] = True
 
-        if system_prompt:
-            payload["system"] = system_prompt
-
+        logger.info("LLM request started")
         logger.info(f"Starting streaming response from Ollama (model: {self.model})")
 
+        first_token_time = None
+        start = time.perf_counter()
         async for chunk in self._stream_call_with_retry(
             "POST",
             "/api/generate",
@@ -332,7 +378,11 @@ class OllamaService:
         ):
             try:
                 data = json.loads(chunk)
-                if "response" in data:
+                if "response" in data and data["response"]:
+                    if first_token_time is None:
+                        first_token_time = time.perf_counter() - start
+                        record_llm_first_token(first_token_time)
+                    logger.info("LLM first token received")
                     yield data["response"]
             except json.JSONDecodeError:
                 continue
@@ -344,7 +394,7 @@ class OllamaService:
         self,
         messages: list[dict],
         system_prompt: str | None = None,
-        temperature: float = 0.3,
+        temperature: float = 0.2,
         top_p: float = 0.8,
     ) -> str:
         """
@@ -363,18 +413,10 @@ class OllamaService:
         if system_prompt:
             chat_messages = [{"role": "system", "content": system_prompt}] + chat_messages
 
-        payload = {
-            "model": self.model,
-            "messages": chat_messages,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": False,
-            "options": {
-                "num_predict": 60,
-                "keep_alive": "30m",
-            },
-        }
+        payload = self._build_chat_payload(chat_messages, system_prompt, temperature, top_p)
+        payload["stream"] = False
 
+        logger.info("LLM request started")
         logger.info(f"Starting chat with Ollama (model: {self.model}, messages: {len(messages)})")
         start = time.perf_counter()
 
@@ -384,7 +426,7 @@ class OllamaService:
             json=payload,
         )
         elapsed = time.perf_counter() - start
-        logger.info("LLM stage completed in %.3f sec", elapsed)
+        logger.info("LLM finished in %.3f sec", elapsed)
 
         if result and "message" in result and "content" in result["message"]:
             response_text = result["message"]["content"].strip()
@@ -398,8 +440,8 @@ class OllamaService:
         self,
         messages: list[dict],
         system_prompt: str | None = None,
-        temperature: float = 0.5,
-        top_p: float = 0.9,
+        temperature: float = 0.2,
+        top_p: float = 0.8,
     ) -> AsyncGenerator[str, None]:
         """
         Streaming chat-based completion with message history.
@@ -419,20 +461,14 @@ class OllamaService:
         if system_prompt:
             chat_messages = [{"role": "system", "content": system_prompt}] + chat_messages
 
-        payload = {
-            "model": self.model,
-            "messages": chat_messages,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": True,
-            "options": {
-                "num_predict": 60,
-                "keep_alive": "30m",
-            },
-        }
+        payload = self._build_chat_payload(chat_messages, system_prompt, temperature, top_p)
+        payload["stream"] = True
 
+        logger.info("LLM request started")
         logger.info(f"Starting streaming chat with Ollama (model: {self.model}, messages: {len(messages)})")
 
+        first_token_time = None
+        start = time.perf_counter()
         async for chunk in self._stream_call_with_retry(
             "POST",
             "/api/chat",
@@ -440,7 +476,11 @@ class OllamaService:
         ):
             try:
                 data = json.loads(chunk)
-                if "message" in data and "content" in data["message"]:
+                if "message" in data and "content" in data["message"] and data["message"]["content"]:
+                    if first_token_time is None:
+                        first_token_time = time.perf_counter() - start
+                        record_llm_first_token(first_token_time)
+                    logger.info("LLM first token received")
                     yield data["message"]["content"]
             except json.JSONDecodeError:
                 continue

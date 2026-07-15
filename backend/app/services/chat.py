@@ -1,4 +1,6 @@
 import logging
+import time
+from typing import Awaitable, Callable
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -9,6 +11,7 @@ from app.schemas.chat import ChatRequest
 from app.schemas.conversation import MessageRead
 from app.services.llm_service import OllamaService
 from app.services.memory import list_memory_items, memory_to_dict
+from app.core.performance import record_llm
 
 logger = setup_logging(__name__)
 
@@ -56,6 +59,7 @@ async def handle_chat_message(
     session: Session,
     payload: ChatRequest,
     llm_service: OllamaService | None = None,
+    stream_handler: Callable[[str], Awaitable[None] | None] | None = None,
 ) -> dict:
     """
     Handle a chat message with LLM integration.
@@ -105,14 +109,30 @@ async def handle_chat_message(
 
         logger.info(f"Generating LLM response for conversation {conversation.id}")
 
-        # Generate response from Ollama
-        assistant_reply = await llm_service.chat(
-            messages=conversation_history,
-            system_prompt=system_prompt,
-            temperature=0.7,
-            top_p=0.9,
-        )
+        llm_start = time.perf_counter()
+        assistant_parts: list[str] = []
 
+        if stream_handler is not None and hasattr(llm_service, "chat_stream"):
+            async for chunk in llm_service.chat_stream(
+                messages=conversation_history,
+                system_prompt=system_prompt,
+                temperature=0.2,
+                top_p=0.8,
+            ):
+                assistant_parts.append(chunk)
+                await stream_handler(chunk)
+        else:
+            assistant_reply = await llm_service.chat(
+                messages=conversation_history,
+                system_prompt=system_prompt,
+                temperature=0.2,
+                top_p=0.8,
+            )
+            assistant_parts.append(assistant_reply)
+
+        record_llm(time.perf_counter() - llm_start)
+
+        assistant_reply = "".join(assistant_parts).strip()
         if not assistant_reply:
             logger.warning("LLM returned empty response, using fallback")
             assistant_reply = (

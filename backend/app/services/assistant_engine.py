@@ -22,10 +22,10 @@ class AssistantState(Enum):
 class AssistantEngine:
     """Coordinator for STT, LLM, and TTS services."""
 
-    def __init__(self) -> None:
+    def __init__(self, tts_service: TTSService | None = None) -> None:
         self.stt_service = STTService()
         self.llm_service = OllamaService()
-        self.tts_service = TTSService()
+        self.tts_service = tts_service or TTSService()
         self.state = AssistantState.IDLE
         self._state_lock = asyncio.Lock()
         self._shutdown_event = asyncio.Event()
@@ -62,22 +62,7 @@ class AssistantEngine:
 
         try:
             logger.info("AssistantEngine: preparing TTS service...")
-            for profile in self.tts_service._voice_profiles.values():
-                if profile.model_path is None or not profile.model_path.exists():
-                    logger.warning(
-                        "AssistantEngine: TTS voice '%s' not configured or missing model path",
-                        profile.key,
-                    )
-                    continue
-                try:
-                    await self.tts_service._load_voice(profile)
-                    logger.info("AssistantEngine: TTS voice '%s' initialized", profile.key)
-                except Exception as exc:
-                    logger.warning(
-                        "AssistantEngine: failed to initialize TTS voice '%s': %s",
-                        profile.key,
-                        exc,
-                    )
+            await self.tts_service.initialize()
             logger.info("AssistantEngine: TTS initialized")
         except Exception as exc:
             logger.error("AssistantEngine: failed to initialize TTS: %s", exc, exc_info=True)

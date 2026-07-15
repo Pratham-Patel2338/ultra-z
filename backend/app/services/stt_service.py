@@ -1,20 +1,22 @@
 import asyncio
 import logging
-import mimetypes
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterable
 from pathlib import Path
+from threading import Lock
 
 from faster_whisper import WhisperModel
 
 from app.core.config import settings
 
-import os
-
 ffmpeg_path = os.getenv("FFMPEG_PATH")
+
+_MODEL_CACHE: dict[tuple[str, str, str], WhisperModel] = {}
+_MODEL_CACHE_LOCK = Lock()
 
 logger = logging.getLogger(__name__)
 
@@ -63,19 +65,35 @@ class STTService:
         self._model: WhisperModel | None = None
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _load_model(model_size: str, device: str, compute_type: str) -> WhisperModel:
+        logger.info("Loading Faster-Whisper model '%s'", model_size)
+        return WhisperModel(
+            model_size,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=os.cpu_count() or 1,
+        )
+
     async def _get_model(self) -> WhisperModel:
+        cache_key = (self.model_size, self.device, self.compute_type)
         if self._model is not None:
             return self._model
 
         async with self._lock:
             if self._model is None:
-                logger.info("Loading Faster-Whisper model '%s'", self.model_size)
-                self._model = await asyncio.to_thread(
-                    WhisperModel,
-                    self.model_size,
-                    device=self.device,
-                    compute_type=self.compute_type,
-                )
+                with _MODEL_CACHE_LOCK:
+                    cached_model = _MODEL_CACHE.get(cache_key)
+                    if cached_model is not None:
+                        self._model = cached_model
+                    else:
+                        self._model = await asyncio.to_thread(
+                            self._load_model,
+                            self.model_size,
+                            self.device,
+                            self.compute_type,
+                        )
+                        _MODEL_CACHE[cache_key] = self._model
         return self._model
 
     @staticmethod
@@ -97,8 +115,9 @@ class STTService:
         fd, temp_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
 
+        ffmpeg_executable = ffmpeg_path or "ffmpeg"
         command = [
-            "ffmpeg",
+            ffmpeg_executable,
             "-y",
             "-i",
             source_path,
@@ -160,6 +179,7 @@ class STTService:
             vad_filter=vad_filter,
             beam_size=1,
             best_of=1,
+            patience=1,
             condition_on_previous_text=False,
         )
 
@@ -175,27 +195,21 @@ class STTService:
         audio_path = source_path
         converted_path: str | None = None
 
-        import time
         start = time.perf_counter()
+        conversion_ms = 0.0
         try:
             suffix = self._detect_format(source_path)
             if suffix == ".wav":
-                pass
-            elif suffix == ".webm":
-                logger.info("Converting WEBM to WAV")
-                converted_path = await asyncio.to_thread(self._convert_to_wav, source_path)
-                audio_path = converted_path
-                logger.info("WEBM conversion complete")
-            elif suffix in {".mp3", ".m4a"}:
-                logger.info("Audio conversion started for %s", source_path)
-                converted_path = await asyncio.to_thread(self._convert_to_wav, source_path)
-                audio_path = converted_path
+                logger.info("Skipping WAV conversion")
             else:
+                conversion_start = time.perf_counter()
                 logger.info("Audio conversion started for %s", source_path)
                 converted_path = await asyncio.to_thread(self._convert_to_wav, source_path)
                 audio_path = converted_path
+                conversion_ms = (time.perf_counter() - conversion_start) * 1000
+                logger.info("Audio conversion: %.0f ms", conversion_ms)
 
-            logger.info("Transcribing audio file: %s", source_path)
+            logger.info("STT started...")
             result = await asyncio.to_thread(
                 self._transcribe_sync,
                 model,
@@ -204,7 +218,9 @@ class STTService:
                 self.vad_filter,
             )
             elapsed = time.perf_counter() - start
-            logger.info("STT stage completed in %.3f sec", elapsed)
+            result["conversion_ms"] = round(conversion_ms, 2)
+            result["stt_ms"] = round(elapsed * 1000, 2)
+            logger.info("STT completed in %.3f sec", elapsed)
             return result
         finally:
             if converted_path:

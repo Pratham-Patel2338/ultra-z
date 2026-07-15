@@ -7,10 +7,19 @@ Run this after starting the backend and Ollama:
 
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.llm_service import OllamaService
+
+
+@pytest.fixture()
+def token() -> str:
+    client = TestClient(app)
+    response = client.post("/api/v1/auth/pin", json={"pin": "1234"})
+    assert response.status_code == 200
+    return response.json()["access_token"]
 
 
 def test_health_check():
@@ -22,6 +31,7 @@ def test_health_check():
     print("✓ Health check passed")
 
 
+@pytest.mark.anyio
 async def test_llm_service():
     """Test OllamaService directly."""
     service = OllamaService()
@@ -57,9 +67,6 @@ def test_authentication():
     assert response.status_code == 401
     print("✓ Invalid PIN rejected")
 
-    return token
-
-
 def test_memory_crud(token: str):
     """Test memory creation and retrieval."""
     client = TestClient(app)
@@ -93,7 +100,7 @@ def test_memory_crud(token: str):
     assert len(memories) > 0
     print(f"✓ Memories listed: {len(memories)} items")
 
-    return memory_id
+    assert memory_id > 0
 
 
 def test_conversation_and_chat(token: str):

@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.routes import auth, chat, conversations, health, llm, memories, reminders, tts, voice, wakeword
+from app.api.routes import auth, chat, conversations, health, llm, memories, reminders, settings, tts, voice, wakeword
 
 api_router = APIRouter()
 api_router.include_router(health.router, tags=["health"])
@@ -12,4 +12,5 @@ api_router.include_router(tts.router, prefix="/voice", tags=["voice"])
 api_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
 api_router.include_router(memories.router, prefix="/memories", tags=["memories"])
 api_router.include_router(reminders.router, prefix="/reminders", tags=["reminders"])
+api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(wakeword.router, prefix="/wakeword", tags=["wakeword"])

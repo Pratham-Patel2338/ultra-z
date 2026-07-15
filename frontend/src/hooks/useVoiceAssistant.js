@@ -10,6 +10,12 @@ const STATES = {
 };
 
 const EXIT_COMMANDS = ['goodbye', 'exit', 'shutdown', 'stop listening'];
+const STT_TIMEOUT_MS = 45000;
+const TTS_TIMEOUT_MS = 30000;
+
+const isTimeoutError = (error) => {
+  return error?.code === 'ECONNABORTED' || String(error?.message || '').toLowerCase().includes('timeout');
+};
 
 const getStatusLabel = (state) => {
   switch (state) {
@@ -42,6 +48,19 @@ export default function useVoiceAssistant() {
   const sourceRef = useRef(null);
   const audioElementRef = useRef(null);
   const vadFrameRef = useRef(null);
+  const activeAudioUrlRef = useRef(null);
+  const pipelineMetricsRef = useRef({
+    recording: 0,
+    upload: 0,
+    conversion: 0,
+    stt: 0,
+    chatApi: 0,
+    llm: 0,
+    tts: 0,
+    playback: 0,
+    total: 0,
+  });
+  const recordingStartedAtRef = useRef(0);
 
   useEffect(() => {
     conversationActiveRef.current = conversationActive;
@@ -57,6 +76,11 @@ export default function useVoiceAssistant() {
     if (vadFrameRef.current) {
       cancelAnimationFrame(vadFrameRef.current);
       vadFrameRef.current = null;
+    }
+
+    if (activeAudioUrlRef.current) {
+      URL.revokeObjectURL(activeAudioUrlRef.current);
+      activeAudioUrlRef.current = null;
     }
 
     if (audioContextRef.current) {
@@ -94,14 +118,12 @@ export default function useVoiceAssistant() {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
     }
-    setRecording(false);
   };
 
   const stopConversation = () => {
     conversationActiveRef.current = false;
     setConversationActive(false);
     setAssistantState(STATES.IDLE);
-    setRecording(false);
     stopAudioPlayback();
     stopRecording();
     clearAudioResources();
@@ -172,65 +194,160 @@ export default function useVoiceAssistant() {
     vadFrameRef.current = requestAnimationFrame(poll);
   };
 
+  const logPipelineMetrics = (metrics) => {
+    const values = [
+      ['Recording', `${(metrics.recording / 1000).toFixed(2)}s`],
+      ['Upload', `${metrics.upload.toFixed(0)}ms`],
+      ['Conversion', `${metrics.conversion.toFixed(0)}ms`],
+      ['STT', `${metrics.stt.toFixed(0)}ms`],
+      ['Chat', `${metrics.chatApi.toFixed(0)}ms`],
+      ['LLM', `${metrics.llm.toFixed(0)}ms`],
+      ['TTS', `${metrics.tts.toFixed(0)}ms`],
+      ['Playback', `${metrics.playback.toFixed(0)}ms`],
+      ['TOTAL', `${metrics.total.toFixed(0)}ms`],
+    ];
+
+    const line = values.map(([label, value]) => `${label.padEnd(12)}${value}`).join('');
+    console.info('==============================VOICE PIPELINE');
+    console.info(line);
+    console.info('==============================');
+  };
+
   const transcribeAudio = async (blob) => {
     const form = new FormData();
     form.append('audio', blob, 'recording.webm');
 
-    const response = await client.post('/api/v1/voice/transcribe', form, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    });
-
-    return response.data?.transcript || '';
+    const start = performance.now();
+    try {
+      const response = await client.post('/api/v1/voice/transcribe', form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: STT_TIMEOUT_MS,
+      });
+      pipelineMetricsRef.current.upload = performance.now() - start;
+      return response.data?.transcript || '';
+    } catch (error) {
+      if (isTimeoutError(error)) {
+        throw new Error('STT_TIMEOUT');
+      }
+      throw error;
+    }
   };
 
-  const sendChat = async (message) => {
-    const response = await client.post('/api/v1/chat', { message });
-    return response.data?.assistant_message?.content || response.data?.response || '';
+  const sendChat = async (message, onDelta) => {
+    const start = performance.now();
+    const token = localStorage.getItem('ultra_z_token');
+    const response = await fetch(`${client.defaults.baseURL}/api/v1/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: token ? `Bearer ${token}` : '',
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify({ message }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Streaming chat failed with ${response.status}`);
+    }
+
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullText = '';
+
+    if (!reader) {
+      throw new Error('Streaming response body unavailable');
+    }
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() || '';
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === '[DONE]') {
+          break;
+        }
+        try {
+          const event = JSON.parse(payload);
+          if (event.delta) {
+            fullText += event.delta;
+            onDelta?.(fullText, event.delta);
+          }
+        } catch (err) {
+          console.warn('Unable to parse stream payload', err);
+        }
+      }
+    }
+
+    pipelineMetricsRef.current.chatApi = performance.now() - start;
+    return fullText;
   };
 
   const requestTTS = async (text) => {
-    const response = await client.post(
-      '/api/v1/voice/speak',
-      { text, voice: 'auto', language: 'auto' },
-      { responseType: 'arraybuffer' },
-    );
-
-    return new Blob([response.data], { type: 'audio/wav' });
+    const start = performance.now();
+    try {
+      const response = await client.post(
+        '/api/v1/voice/speak',
+        { text, voice: 'auto', language: 'auto' },
+        { responseType: 'arraybuffer', timeout: TTS_TIMEOUT_MS },
+      );
+      pipelineMetricsRef.current.tts = performance.now() - start;
+      return new Blob([response.data], { type: 'audio/wav' });
+    } catch (error) {
+      if (isTimeoutError(error)) {
+        throw new Error('TTS_TIMEOUT');
+      }
+      throw error;
+    }
   };
 
   const playAudioBlob = async (blob) => {
     const audioUrl = URL.createObjectURL(blob);
+    activeAudioUrlRef.current = audioUrl;
     const audio = new Audio(audioUrl);
     audioElementRef.current = audio;
 
-    audio.addEventListener('ended', async () => {
-      URL.revokeObjectURL(audioUrl);
+    const cleanupPlayback = () => {
+      if (activeAudioUrlRef.current === audioUrl) {
+        URL.revokeObjectURL(audioUrl);
+        activeAudioUrlRef.current = null;
+      }
       audioElementRef.current = null;
+    };
 
+    audio.addEventListener('ended', () => {
+      cleanupPlayback();
       if (conversationActiveRef.current) {
-        await startListeningCycle();
+        void startListeningCycle();
       } else {
         setAssistantState(STATES.IDLE);
       }
     });
 
-    audio.addEventListener('error', async () => {
-      URL.revokeObjectURL(audioUrl);
-      audioElementRef.current = null;
+    audio.addEventListener('error', () => {
+      cleanupPlayback();
       if (conversationActiveRef.current) {
-        await startListeningCycle();
+        void startListeningCycle();
       } else {
         setAssistantState(STATES.IDLE);
       }
     });
 
     try {
+      const playbackStart = performance.now();
       await audio.play();
+      pipelineMetricsRef.current.playback = performance.now() - playbackStart;
     } catch (err) {
+      cleanupPlayback();
       console.warn('Audio playback failed', err);
       setError('Unable to play assistant voice.');
       if (conversationActiveRef.current) {
-        await startListeningCycle();
+        void startListeningCycle();
       } else {
         setAssistantState(STATES.IDLE);
       }
@@ -241,6 +358,19 @@ export default function useVoiceAssistant() {
     if (!conversationActiveRef.current) {
       return;
     }
+
+    const pipelineStart = performance.now();
+    pipelineMetricsRef.current = {
+      recording: 0,
+      upload: 0,
+      conversion: 0,
+      stt: 0,
+      chatApi: 0,
+      llm: 0,
+      tts: 0,
+      playback: 0,
+      total: 0,
+    };
 
     setAssistantState(STATES.THINKING);
     setError(null);
@@ -272,24 +402,40 @@ export default function useVoiceAssistant() {
         return;
       }
 
-      const assistantMessage = await sendChat(transcriptText);
+      let assistantMessage = '';
+      await sendChat(transcriptText, (partialText) => {
+        assistantMessage = partialText;
+        setResponseText(partialText);
+      });
       if (!conversationActiveRef.current) {
         return;
       }
 
-      setResponseText(assistantMessage);
+      setResponseText(assistantMessage || 'I am listening.');
       setAssistantState(STATES.SPEAKING);
       const ttsAudio = await requestTTS(assistantMessage || 'I am listening.');
       await playAudioBlob(ttsAudio);
     } catch (err) {
       console.error('Conversation loop failed', err);
-      setError('The assistant had trouble processing that.');
+      if (err?.message === 'STT_TIMEOUT') {
+        setError('Speech recognition took too long. Please try again.');
+      } else if (err?.message === 'TTS_TIMEOUT') {
+        setError('Speech synthesis took too long. Please try again.');
+      } else {
+        setError('The assistant had trouble processing that.');
+      }
       if (conversationActiveRef.current) {
         setAssistantState(STATES.LISTENING);
         await startListeningCycle();
       } else {
         setAssistantState(STATES.IDLE);
       }
+    } finally {
+      pipelineMetricsRef.current.total = performance.now() - pipelineStart;
+      if (pipelineMetricsRef.current.recording === 0) {
+        pipelineMetricsRef.current.recording = performance.now() - recordingStartedAtRef.current;
+      }
+      logPipelineMetrics(pipelineMetricsRef.current);
     }
   };
 
@@ -302,6 +448,7 @@ export default function useVoiceAssistant() {
     setError(null);
     setAssistantState(STATES.LISTENING);
     setRecording(true);
+    recordingStartedAtRef.current = performance.now();
 
     try {
       const stream = await getMicrophoneStream();
@@ -317,6 +464,7 @@ export default function useVoiceAssistant() {
       });
 
       recorder.addEventListener('stop', async () => {
+        pipelineMetricsRef.current.recording = performance.now() - recordingStartedAtRef.current;
         setRecording(false);
         clearAudioResources();
         if (!conversationActiveRef.current) {

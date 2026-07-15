@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from app.api.router import api_router
+from app.api.routes.tts import get_tts_service
 from app.core.config import settings
 from app.core.logging_config import setup_logging
 from app.db.session import init_db
@@ -25,8 +26,10 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(init_db)
     logger.info("Database initialized")
 
-    engine = AssistantEngine()
+    tts_service = get_tts_service()
+    engine = AssistantEngine(tts_service=tts_service)
     await engine.initialize()
+    app.state.tts_service = tts_service
     app.state.engine = engine
     engine_task = asyncio.create_task(engine.run())
     engine.attach_run_task(engine_task)

@@ -1,17 +1,14 @@
 import asyncio
 import hashlib
 import logging
-import os
-import shutil
-import tempfile
 import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-
-from piper import PiperVoice, SynthesisConfig
+from typing import Any, Protocol
 
 from app.core.config import settings
+from app.services.kokoro_tts_service import KokoroTTSService
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +17,20 @@ logger = logging.getLogger(__name__)
 class VoiceProfile:
     key: str
     display_name: str
-    model_path: Path | None
-    config_path: Path | None
     language: str | None = None
+
+
+class TTSEngine(Protocol):
+    async def synthesize(self, text: str, voice: str | None = None, language: str | None = None) -> "TTSResult":
+        ...
+
+    async def synthesize_stream(
+        self,
+        chunks: list[str],
+        voice: str | None = None,
+        language: str | None = None,
+    ) -> "TTSResult":
+        ...
 
 
 @dataclass(slots=True)
@@ -32,62 +40,38 @@ class TTSResult:
     language: str | None
     cached: bool
     sample_rate: int | None
+    generation_ms: float | None = None
+    audio_bytes: bytes | None = None
+    timings_ms: dict[str, float] | None = None
 
 
 class TTSService:
-    """Text-to-speech service backed by Piper TTS."""
+    """TTS abstraction backed by the real Kokoro ONNX engine when available."""
 
     def __init__(self) -> None:
         self.cache_dir = Path(settings.tts_cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-        self.cache_ttl_seconds = max(1, int(settings.tts_cache_ttl_hours * 3600))
-        self.cache_max_files = max(1, int(settings.tts_cache_max_files))
         self.default_voice = settings.tts_default_voice.lower().strip() or "auto"
-        self.use_cuda = bool(settings.tts_use_cuda)
         self.length_scale = float(settings.tts_length_scale)
         self.noise_scale = float(settings.tts_noise_scale)
         self.noise_w_scale = float(settings.tts_noise_w_scale)
 
         self._voice_profiles = self._build_voice_profiles()
-        self._voice_cache: dict[str, PiperVoice] = {}
-        self._voice_locks: dict[str, asyncio.Lock] = {}
-        self._voice_locks_guard = asyncio.Lock()
-        self._cleanup_lock = asyncio.Lock()
-        self._last_cleanup_at = 0.0
-        self._cleanup_interval_seconds = 15 * 60
+        self._backend: Any | None = None
+        self._initialization_started = False
+        self._initialization_finished = False
+        self._initialization_time_s = 0.0
+        self._first_synthesis_latency_s = 0.0
+        self._total_synthesis_time_s = 0.0
+        self._synthesis_count = 0
+        self._startup_timings_ms: dict[str, float] = {}
 
     def _build_voice_profiles(self) -> dict[str, VoiceProfile]:
-        profiles = {
-            "english": VoiceProfile(
-                key="english",
-                display_name="English",
-                model_path=self._resolve_path(settings.tts_english_model_path),
-                config_path=self._resolve_path(settings.tts_english_config_path),
-                language="en",
-            ),
-            "hindi": VoiceProfile(
-                key="hindi",
-                display_name="Hindi",
-                model_path=self._resolve_path(settings.tts_hindi_model_path),
-                config_path=self._resolve_path(settings.tts_hindi_config_path),
-                language="hi",
-            ),
-            "gujarati": VoiceProfile(
-                key="gujarati",
-                display_name="Gujarati",
-                model_path=self._resolve_path(settings.tts_gujarati_model_path),
-                config_path=self._resolve_path(settings.tts_gujarati_config_path),
-                language="gu",
-            ),
+        return {
+            "english": VoiceProfile(key="english", display_name="English", language="en"),
+            "hindi": VoiceProfile(key="hindi", display_name="Hindi", language="hi"),
+            "gujarati": VoiceProfile(key="gujarati", display_name="Gujarati", language="gu"),
         }
-        return profiles
-
-    @staticmethod
-    def _resolve_path(value: str | None) -> Path | None:
-        if not value:
-            return None
-        return Path(value).expanduser().resolve()
 
     @staticmethod
     def _normalize_text(text: str) -> str:
@@ -107,14 +91,15 @@ class TTSService:
     def _resolve_voice_key(self, voice: str | None, language: str | None, text: str) -> str:
         voice_value = (voice or self.default_voice).lower().strip()
         if voice_value and voice_value != "auto":
-            return {
-                "en": "english",
-                "english": "english",
-                "hi": "hindi",
-                "hindi": "hindi",
-                "gu": "gujarati",
-                "gujarati": "gujarati",
-            }.get(voice_value, "english")
+            if voice_value in {"en", "english", "en-us", "en_us"}:
+                return "english"
+            if voice_value in {"hi", "hindi"}:
+                return "hindi"
+            if voice_value in {"gu", "gujarati"}:
+                return "gujarati"
+            if voice_value in {"af_bella", "af_sky", "am_adam", "bm_fable", "bf_emma", "bm_george", "af_nicole", "af_sarah", "af_heart"}:
+                return voice_value
+            return voice_value
 
         language_value = (language or "auto").lower().strip()
         if language_value != "auto":
@@ -136,35 +121,6 @@ class TTSService:
             raise ValueError(f"Unknown voice '{voice_key}'")
         return profile
 
-    def _ensure_voice_ready(self, profile: VoiceProfile) -> None:
-        if profile.model_path is None:
-            raise RuntimeError(
-                f"No Piper model configured for '{profile.display_name}'. Set the model path in the environment."
-            )
-        if not profile.model_path.exists():
-            raise RuntimeError(
-                f"Piper model file not found for '{profile.display_name}': {profile.model_path}"
-            )
-        if profile.config_path is not None and not profile.config_path.exists():
-            raise RuntimeError(
-                f"Piper config file not found for '{profile.display_name}': {profile.config_path}"
-            )
-
-    def _voice_cache_key(self, profile: VoiceProfile) -> str:
-        model_stat = profile.model_path.stat() if profile.model_path and profile.model_path.exists() else None
-        config_stat = profile.config_path.stat() if profile.config_path and profile.config_path.exists() else None
-        payload = "|".join(
-            [
-                profile.key,
-                str(profile.model_path),
-                str(model_stat.st_mtime_ns if model_stat else 0),
-                str(profile.config_path),
-                str(config_stat.st_mtime_ns if config_stat else 0),
-                str(self.use_cuda),
-            ]
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
     def _text_cache_key(self, text: str, voice_key: str, language: str | None) -> str:
         payload = "|".join(
             [
@@ -178,143 +134,169 @@ class TTSService:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    async def _get_voice_lock(self, voice_key: str) -> asyncio.Lock:
-        async with self._voice_locks_guard:
-            lock = self._voice_locks.get(voice_key)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._voice_locks[voice_key] = lock
-            return lock
-
-    def _load_voice_sync(self, profile: VoiceProfile) -> PiperVoice:
-        self._ensure_voice_ready(profile)
-        assert profile.model_path is not None
-        config_path = profile.config_path
-        logger.info("Loading Piper voice '%s' from %s", profile.key, profile.model_path)
-        return PiperVoice.load(
-            profile.model_path,
-            config_path=config_path,
-            use_cuda=self.use_cuda,
-            download_dir=self.cache_dir,
-        )
-
-    async def _load_voice(self, profile: VoiceProfile) -> PiperVoice:
-        voice = self._voice_cache.get(profile.key)
-        if voice is not None:
-            return voice
-
-        voice = await asyncio.to_thread(self._load_voice_sync, profile)
-        self._voice_cache[profile.key] = voice
-        return voice
-
     @staticmethod
-    def _write_wave_to_path(voice: PiperVoice, text: str, wav_path: Path, length_scale: float, noise_scale: float, noise_w_scale: float) -> int | None:
-        syn_config = SynthesisConfig(
-            length_scale=length_scale,
-            noise_scale=noise_scale,
-            noise_w_scale=noise_w_scale,
-            normalize_audio=True,
-        )
-        with wave.open(str(wav_path), "wb") as wav_file:
-            alignments = voice.synthesize_wav(text, wav_file, syn_config=syn_config)
-            try:
-                return wav_file.getframerate()
-            except Exception:
-                return None
+    def _wav_has_signal(path: Path, min_peak: int = 16) -> bool:
+        try:
+            with wave.open(str(path), "rb") as wav_file:
+                frames = wav_file.readframes(wav_file.getnframes())
+                sample_width = wav_file.getsampwidth()
+            if not frames:
+                return False
+            if sample_width == 2:
+                import array
 
-    def _cleanup_cache_sync(self) -> None:
-        now = time.time()
-        audio_files = sorted(
-            self.cache_dir.glob("*.wav"),
-            key=lambda path: path.stat().st_mtime,
-        )
+                samples = array.array("h")
+                samples.frombytes(frames)
+                return bool(samples) and max(abs(sample) for sample in samples) >= min_peak
+            return any(byte not in {0, 128} for byte in frames)
+        except Exception as exc:
+            logger.warning("TTS: could not validate cached audio %s: %s", path, exc)
+            return False
 
-        removed = 0
-        for audio_file in audio_files:
-            try:
-                age_seconds = now - audio_file.stat().st_mtime
-            except FileNotFoundError:
-                continue
-            if age_seconds > self.cache_ttl_seconds:
-                audio_file.unlink(missing_ok=True)
-                removed += 1
+    async def initialize(self) -> None:
+        if self._initialization_finished:
+            return
+        if self._initialization_started:
+            while not self._initialization_finished:
+                await asyncio.sleep(0.01)
+            return
+        if self._backend is not None:
+            self._initialization_finished = True
+            return
 
-        remaining_files = sorted(
-            self.cache_dir.glob("*.wav"),
-            key=lambda path: path.stat().st_mtime,
-        )
-        if len(remaining_files) > self.cache_max_files:
-            overflow = len(remaining_files) - self.cache_max_files
-            for old_file in remaining_files[:overflow]:
-                old_file.unlink(missing_ok=True)
-                removed += 1
-
-        if removed:
-            logger.info("Cleaned up %s old cached TTS files", removed)
-
-    async def cleanup_old_files(self) -> None:
-        async with self._cleanup_lock:
-            now = time.time()
-            if now - self._last_cleanup_at < self._cleanup_interval_seconds:
-                return
-            self._last_cleanup_at = now
-            await asyncio.to_thread(self._cleanup_cache_sync)
+        self._initialization_started = True
+        started_at = time.perf_counter()
+        logger.info("TTS: initializing Kokoro backend")
+        try:
+            backend = KokoroTTSService()
+            await backend.initialize()
+            self._backend = backend
+            self._initialization_time_s = time.perf_counter() - started_at
+            self._startup_timings_ms = dict(getattr(backend, "_startup_timings_ms", {}))
+            logger.info("TTS: Kokoro backend ready in %.3f s", self._initialization_time_s)
+        except Exception as exc:
+            self._backend = None
+            self._initialization_time_s = time.perf_counter() - started_at
+            logger.exception("TTS backend unavailable")
+            raise RuntimeError(f"TTS backend unavailable: {exc}") from exc
+        finally:
+            self._initialization_finished = True
 
     async def generate_speech(self, text: str, voice: str | None = None, language: str | None = None) -> TTSResult:
+        timings: dict[str, float] = {}
+        normalize_start = time.perf_counter()
         normalized_text = self._normalize_text(text)
+        timings["text_normalization_ms"] = (time.perf_counter() - normalize_start) * 1000
         if not normalized_text:
             raise ValueError("Text is required")
 
-        await self.cleanup_old_files()
+        if self._backend is None:
+            initialize_start = time.perf_counter()
+            await self.initialize()
+            initialization_ms = (time.perf_counter() - initialize_start) * 1000
+            timings["engine_initialization_ms"] = initialization_ms
+            if initialization_ms > 1.0:
+                for key, value in self._startup_timings_ms.items():
+                    timings.setdefault(key, value)
+        else:
+            timings["engine_initialization_ms"] = 0.0
 
         voice_key = self._resolve_voice_key(voice, language, normalized_text)
-        profile = self._get_voice_profile(voice_key)
-        effective_language = language if language and language.lower() != "auto" else profile.language or self._detect_language(normalized_text)
+        effective_language = language if language and language.lower() != "auto" else self._detect_language(normalized_text)
         cache_key = self._text_cache_key(normalized_text, voice_key, effective_language)
         cache_path = self.cache_dir / f"{cache_key}.wav"
-        voice_lock = await self._get_voice_lock(voice_key)
 
         start = time.perf_counter()
+        cache_start = time.perf_counter()
+        cache_ready = await asyncio.to_thread(lambda: cache_path.exists() and cache_path.stat().st_size > 0)
+        timings["cache_lookup_ms"] = (time.perf_counter() - cache_start) * 1000
+        if cache_ready:
+            signal_start = time.perf_counter()
+            has_signal = await asyncio.to_thread(self._wav_has_signal, cache_path)
+            timings["file_io_ms"] = (time.perf_counter() - signal_start) * 1000
+            if not has_signal:
+                logger.warning("TTS: removing silent cached audio %s", cache_path)
+                await asyncio.to_thread(lambda: cache_path.unlink(missing_ok=True))
+            else:
+                logger.info("TTS: returning cached audio for %s", voice_key)
+                timings["total_ms"] = (time.perf_counter() - start) * 1000
+                self._log_profile(timings, cached=True)
+                return TTSResult(cache_path, voice_key, effective_language, True, 24000, generation_ms=0.0, timings_ms=timings)
 
-        async with voice_lock:
-            if cache_path.exists() and cache_path.stat().st_size > 0:
-                logger.info("Returning cached TTS audio for voice=%s", voice_key)
-                sample_rate = await asyncio.to_thread(self._read_sample_rate, cache_path)
-                return TTSResult(cache_path, voice_key, effective_language, True, sample_rate)
-
-            voice_model = self._voice_cache.get(profile.key)
-            if voice_model is None:
-                voice_model = await self._load_voice(profile)
-
-            tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=".wav", dir=self.cache_dir)
-            os.close(tmp_fd)
-            tmp_path = Path(tmp_path_str)
-
+        if self._backend is not None and hasattr(self._backend, "generate_speech"):
             try:
-                await asyncio.to_thread(
-                    self._write_wave_to_path,
-                    voice_model,
-                    normalized_text,
-                    tmp_path,
-                    self.length_scale,
-                    self.noise_scale,
-                    self.noise_w_scale,
-                )
-                os.replace(tmp_path, cache_path)
-                sample_rate = await asyncio.to_thread(self._read_sample_rate, cache_path)
-                elapsed = time.perf_counter() - start
-                logger.info("TTS stage completed in %.3f sec", elapsed)
-                logger.info("Generated TTS audio voice=%s cached at %s", voice_key, cache_path)
-                return TTSResult(cache_path, voice_key, effective_language, False, sample_rate)
+                backend_result = await self._backend.generate_speech(normalized_text, voice=voice_key, language=effective_language)
+                audio_path = backend_result.audio_path
+                audio_exists = await asyncio.to_thread(audio_path.exists)
+                if audio_exists:
+                    backend_timings = getattr(backend_result, "timings_ms", None) or {}
+                    timings.update({key: value for key, value in backend_timings.items() if key not in timings or value > timings[key]})
+                    if backend_result.cached:
+                        signal_start = time.perf_counter()
+                        has_signal = await asyncio.to_thread(self._wav_has_signal, audio_path)
+                        timings["file_io_ms"] = timings.get("file_io_ms", 0.0) + (time.perf_counter() - signal_start) * 1000
+                    else:
+                        has_signal = True
+                    if not has_signal:
+                        await asyncio.to_thread(lambda: audio_path.unlink(missing_ok=True))
+                        raise RuntimeError("TTS backend produced silent audio")
+                    elapsed = time.perf_counter() - start
+                    self._total_synthesis_time_s += elapsed
+                    self._synthesis_count += 1
+                    if self._synthesis_count == 1:
+                        self._first_synthesis_latency_s = elapsed
+                    logger.info("TTS: backend synth complete in %.3f s", elapsed)
+                    timings["total_ms"] = elapsed * 1000
+                    self._log_profile(timings, cached=backend_result.cached)
+                    return TTSResult(
+                        audio_path=audio_path,
+                        voice=voice_key,
+                        language=effective_language,
+                        cached=backend_result.cached,
+                        sample_rate=backend_result.sample_rate,
+                        generation_ms=backend_result.generation_ms,
+                        audio_bytes=getattr(backend_result, "audio_bytes", None),
+                        timings_ms=timings,
+                    )
+                raise RuntimeError("TTS backend did not produce an audio file")
             except Exception:
-                tmp_path.unlink(missing_ok=True)
+                logger.exception("TTS backend synthesis failed")
                 raise
+
+        raise RuntimeError("TTS backend is not initialized")
+
+    def _log_profile(self, timings: dict[str, float], cached: bool) -> None:
+        ordered_keys = [
+            "cache_lookup_ms",
+            "text_normalization_ms",
+            "engine_initialization_ms",
+            "model_loading_ms",
+            "voice_loading_ms",
+            "phonemization_ms",
+            "onnx_inference_ms",
+            "audio_post_processing_ms",
+            "wav_encoding_ms",
+            "file_io_ms",
+            "total_ms",
+        ]
+        summary = " ".join(f"{key}={timings.get(key, 0.0):.2f}" for key in ordered_keys)
+        logger.info("TTS profile cached=%s %s", cached, summary)
+
+    async def synthesize(self, text: str, voice: str | None = None, language: str | None = None) -> TTSResult:
+        return await self.generate_speech(text=text, voice=voice, language=language)
+
+    async def synthesize_stream(
+        self,
+        chunks: list[str],
+        voice: str | None = None,
+        language: str | None = None,
+    ) -> TTSResult:
+        return await self.generate_speech(text="".join(chunks), voice=voice, language=language)
 
     async def speak(self, text: str, voice: str | None = None, language: str | None = None) -> Path:
         logger.info("Generating speech")
         result = await self.generate_speech(text=text, voice=voice, language=language)
-
-        logger.info("Playing response")
+        logger.info("Playback started")
         try:
             from wakeword.audio_utils import play_wav  # noqa: PLC0415
             play_wav(result.audio_path)
@@ -322,13 +304,13 @@ class TTSService:
         except Exception as exc:
             logger.error("Speech playback failed: %s", exc, exc_info=True)
             raise
-
         return result.audio_path
 
-    @staticmethod
-    def _read_sample_rate(wav_path: Path) -> int | None:
-        try:
-            with wave.open(str(wav_path), "rb") as wav_file:
-                return wav_file.getframerate()
-        except Exception:
-            return None
+    @property
+    def metrics(self) -> dict[str, float | int]:
+        return {
+            "initialization_time_s": self._initialization_time_s,
+            "first_synthesis_latency_s": self._first_synthesis_latency_s,
+            "total_synthesis_time_s": self._total_synthesis_time_s,
+            "average_synthesis_latency_s": self._total_synthesis_time_s / self._synthesis_count if self._synthesis_count else 0.0,
+        }

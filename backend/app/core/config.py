@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     ollama_timeout: int = 300
     ollama_retry_attempts: int = 3
     ollama_retry_delay: float = 1.0
+    # Ollama generation tuning defaults (can be overridden via env).
+    # Keep this high enough for normal assistant answers; too-low values truncate responses.
+    ollama_num_predict: int = 256
+    ollama_num_ctx: int = 2048
+    ollama_repeat_penalty: float = 1.05
 
     # Speech-to-text configuration
     whisper_model: str = "base"
@@ -33,8 +38,12 @@ class Settings(BaseSettings):
     tts_cache_ttl_hours: int = 24
     tts_cache_max_files: int = 500
     tts_default_voice: str = "auto"
+    tts_engine: str = "kokoro"
     tts_use_cuda: bool = False
     tts_length_scale: float = 0.85
+    tts_kokoro_model_path: str | None = None
+    tts_kokoro_voices_path: str | None = None
+    tts_kokoro_default_voice: str = "af_bella"
     tts_noise_scale: float = 0.55
     tts_noise_w_scale: float = 0.6
     tts_english_model_path: str | None = None
